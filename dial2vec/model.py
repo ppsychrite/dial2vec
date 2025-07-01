@@ -1,6 +1,16 @@
 import torch.nn as nn 
 import torch 
 
+
+class AddPooler(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        self.activation = nn.Tanh()
+
+    def forward(self, cls_embedding):
+        return self.activation(self.dense(cls_embedding))
+
 class PoolingAverage(nn.Module):
     def __init__(self, eps=1e-12):
         super(PoolingAverage, self).__init__()
@@ -20,26 +30,37 @@ class PoolingAverage(nn.Module):
     
 
 class DialogueTransformer(nn.Module):
-    def __init__(self, model, config, tokenizer, logger):
+    def __init__(self, model, config, tokenizer, logger, args : dict = {"temperature" : 1.0}):
         super(DialogueTransformer, self).__init__()
         self.bert = model 
         self.config = config
         self.tokenizer = tokenizer
+        self.args = args 
 
-        self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
+        if hasattr(self.config, 'hidden_dropout_prob'): 
+            self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
+        elif hasattr(self.config, 'attention_dropout'):
+            self.dropout = nn.Dropout(self.config.attention_dropout)
+        else: 
+            raise RuntimeError("Config given to DialogueTransformer doesn't have value to use for dropout")
+
+
+        if not hasattr(self.bert, 'pooler'):
+            self.pooler = AddPooler(self.config.hidden_size)
+
         self.labels_data = None
         self.sample_nums = 10
         self.log_softmax = nn.LogSoftmax(dim=-1)
         self.avg = PoolingAverage(eps=1e-6)
         self.logger = logger  
 
+
+
     def forward(self, data, strategy='mean_by_role', output_attention=False):
+        max_seq_length = 512 #config.max_position_embeddings
 
 
-        if len(data) == 7:
-            input_ids, attention_mask, token_type_ids, role_ids, turn_ids, position_ids, labels = data
-        else:
-            input_ids, attention_mask, token_type_ids, role_ids, turn_ids, position_ids, labels, guids = data
+        input_ids, attention_mask, token_type_ids, role_ids, turn_ids, position_ids, labels = data
 
         input_ids = input_ids.view(input_ids.size()[0] * input_ids.size()[1], input_ids.size()[-1])
         attention_mask = attention_mask.view(attention_mask.size()[0] * attention_mask.size()[1], attention_mask.size()[-1])
@@ -65,7 +86,7 @@ class DialogueTransformer(nn.Module):
         w = torch.matmul(q_self_output, r_self_output.transpose(-1, -2))
 
         if turn_ids is not None:
-            view_turn_mask = turn_ids.unsqueeze(1).repeat(1, self.config.max_position_embeddings, 1)
+            view_turn_mask = turn_ids.unsqueeze(1).repeat(1, max_seq_length, 1)
             view_turn_mask_transpose = view_turn_mask.transpose(2, 1)
             view_range_mask = torch.where(abs(view_turn_mask_transpose - view_turn_mask) <= 1000,
                                           torch.ones_like(view_turn_mask),
@@ -103,6 +124,7 @@ class DialogueTransformer(nn.Module):
             logit_r.append(cos_r)
             logit_q.append(cos_q)
 
+
         logit_r = torch.stack(logit_r, dim=1)
         logit_q = torch.stack(logit_q, dim=1)
 
@@ -123,19 +145,27 @@ class DialogueTransformer(nn.Module):
     def encoder(self, *x):
         input_ids, attention_mask, token_type_ids, position_ids, _, _ = x    
 
+       
         output = self.bert(input_ids=input_ids,
                             attention_mask=attention_mask,
-                            token_type_ids=token_type_ids,
+                            #token_type_ids=token_type_ids,
                             position_ids=position_ids,
                             output_hidden_states=True,
                             return_dict=True)
+
         all_output = output['hidden_states']
-        pooler_output = output['pooler_output']
+
+        if 'pooler_output' in output: 
+            pooler_output = output['pooler_output']
+        else: 
+            pooler_output = output['last_hidden_state'][:, 0]
+            pooler_output = torch.tanh(self.pooler.dense(pooler_output))
+
         return all_output[-1], pooler_output
 
     def calc_cos(self, x, y):
         cos = torch.cosine_similarity(x, y, dim=1)
-        cos = cos / 1.0 # cos = cos / 2.0
+        cos = cos / self.args["temperature"]
         return cos
 
     def calc_loss(self, pred, labels):

@@ -25,7 +25,7 @@ class Session():
     
 """
 def get_sessions(file_path : str, tokenizer : AutoTokenizer, config : AutoConfig) -> list:
-    max_seq_length = config.max_position_embeddings
+    max_seq_length = 512 #config.max_position_embeddings
     features = []
 
     f = codecs.open(file_path, "r", "utf")
