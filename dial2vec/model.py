@@ -30,13 +30,16 @@ class PoolingAverage(nn.Module):
     
 
 class DialogueTransformer(nn.Module):
-    def __init__(self, model, config, tokenizer, logger, args : dict = {"temperature" : 1.0}):
+    def __init__(self, model, config, tokenizer, logger, **kwargs):
         super(DialogueTransformer, self).__init__()
         self.bert = model 
         self.config = config
         self.tokenizer = tokenizer
-        self.args = args 
+        self.temperature = kwargs["temperature"] if "temperature" in kwargs else 1.0
+        self.max_tokens = kwargs["max_tokens"] if "max_tokens" in kwargs else config.max_position_embeddings 
 
+
+        # Varies between BERT models 
         if hasattr(self.config, 'hidden_dropout_prob'): 
             self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
         elif hasattr(self.config, 'attention_dropout'):
@@ -57,7 +60,6 @@ class DialogueTransformer(nn.Module):
 
 
     def forward(self, data, strategy='mean_by_role', output_attention=False):
-        max_seq_length = 512 #config.max_position_embeddings
 
 
         input_ids, attention_mask, token_type_ids, role_ids, turn_ids, position_ids, labels = data
@@ -86,7 +88,7 @@ class DialogueTransformer(nn.Module):
         w = torch.matmul(q_self_output, r_self_output.transpose(-1, -2))
 
         if turn_ids is not None:
-            view_turn_mask = turn_ids.unsqueeze(1).repeat(1, max_seq_length, 1)
+            view_turn_mask = turn_ids.unsqueeze(1).repeat(1, self.max_tokens, 1)
             view_turn_mask_transpose = view_turn_mask.transpose(2, 1)
             view_range_mask = torch.where(abs(view_turn_mask_transpose - view_turn_mask) <= 1000,
                                           torch.ones_like(view_turn_mask),
@@ -165,7 +167,7 @@ class DialogueTransformer(nn.Module):
 
     def calc_cos(self, x, y):
         cos = torch.cosine_similarity(x, y, dim=1)
-        cos = cos / self.args["temperature"]
+        cos = cos / self.temperature
         return cos
 
     def calc_loss(self, pred, labels):

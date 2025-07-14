@@ -21,11 +21,9 @@ class Session():
 """ 
     Given data stored in order\tsessions\tlabel format, parse it and return list of "Session"
         where order is 1s and 0s representing the order of the dialogue. 
-    
-    
 """
-def get_sessions(file_path : str, tokenizer : AutoTokenizer, config : AutoConfig) -> list:
-    max_seq_length = 512 #config.max_position_embeddings
+def get_sessions(file_path : str, tokenizer : AutoTokenizer, config : AutoConfig, **kwargs) -> list:
+    max_seq_length = kwargs["max_tokens"] if "max_tokens" in kwargs else config.max_position_embeddings 
     features = []
 
     f = codecs.open(file_path, "r", "utf")
@@ -104,7 +102,8 @@ def get_sessions(file_path : str, tokenizer : AutoTokenizer, config : AutoConfig
             sample_input_mask.append(text_input_mask) 
 
 
-        n_neg = 9
+        # First sample is positive and others are randomly shuffled 
+        n_neg = len(samples) - 1
         label_id = [1] + [0] * n_neg
         session = Session(input_ids=sample_input_ids,
                                     input_mask=sample_input_mask,
