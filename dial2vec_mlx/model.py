@@ -1,22 +1,8 @@
 import mlx 
 import mlx.core as mx 
 import mlx.nn as nn 
-from sklearn.metrics.pairwise import cosine_similarity
+from mlx.nn.losses import cosine_similarity_loss
 
-# Since ModernBERT no longer does this  
-class AddPooler(nn.Module): 
-    def __init__(self, hidden_size: int): 
-        super().__init__()
-        self.dense = nn.Linear(hidden_size, hidden_size)
-        self.activation = nn.Tanh()
-    
-    def __call__(self, 
-                 weights: mx.array): 
-        return self.activation(
-            self.dense(
-                weights
-            )
-        )
 
 class PoolingAverage(nn.Module): 
     def __init__(self, eps = 1e12): 
@@ -28,7 +14,7 @@ class PoolingAverage(nn.Module):
                  hidden_states: mx.array, 
                  attention_mask: mx.array): 
 
-        a = hidden_states * mx.expand_dims(attention_mask, dim = -1) 
+        a = mx.sum(hidden_states * mx.expand_dims(attention_mask, axis = -1), axis = 1)
         b = mx.sum(attention_mask, axis = 1, keepdims = True)
 
         return a / b + self.eps
@@ -38,7 +24,6 @@ class DialogueTransformer(nn.Module):
     def __init__(self, bert):
         super().__init__()
 
-        self.pooler = AddPooler(bert.config.hidden_size)
         self.model = bert
         self.averager = PoolingAverage(eps = 1e-6)
         self.log_softmax = nn.LogSoftmax()
@@ -46,10 +31,23 @@ class DialogueTransformer(nn.Module):
         self.hidden_size = self.model.config.hidden_size 
         self.sample_nums = 10 
 
-        pass 
 
-    def __call__(self, data):
-        input_ids, attention_mask, position_ids, role_ids = data  
+    def __call__(self, 
+                 input_ids, 
+                 attention_mask, 
+                 position_ids, 
+                 role_ids,
+                 labels, 
+                 strategy = 'mean_by_role',
+    ):
+
+
+        # Reshape batches together 
+        new_shape = (input_ids.shape[0] * input_ids.shape[1], input_ids.shape[-1])
+        input_ids = mx.reshape(input_ids, new_shape)
+        attention_mask = mx.reshape(attention_mask, new_shape)
+        position_ids = mx.reshape(attention_mask, new_shape)
+        role_ids = mx.reshape(role_ids, new_shape)
 
         one_mask = mx.ones_like(role_ids)
         zero_mask = mx.zeros_like(role_ids)
@@ -60,24 +58,24 @@ class DialogueTransformer(nn.Module):
         a_attention_mask = (attention_mask * role_a_mask)
         b_attention_mask = (attention_mask * role_b_mask)
 
+
         self_output, pooled_output = self.encode(input_ids, 
                                                  attention_mask, 
                                                  position_ids)
+
 
         q_self_output = self_output * mx.expand_dims(a_attention_mask, axis = -1)
         r_self_output = self_output * mx.expand_dims(b_attention_mask, axis = -1)
 
         self_output = self_output * mx.expand_dims(attention_mask, axis = -1)
 
-        w = mx.matmul(q_self_output, r_self_output.transpose(axes = [-1, -2]))
+
+        w = mx.matmul(q_self_output, mx.transpose(r_self_output, axes = [0, -1, -2]))
 
         # Turn id check is deprecated in ModernBERT, skip it 
 
         q_cross_output = mx.matmul(
-            w.moveaxis(
-                source = (0, 1, 2), 
-                destination = (0, 2, 1)
-            ),
+            mx.transpose(w, axes = [0, 2, 1]),
             q_self_output
         )
 
@@ -91,14 +89,20 @@ class DialogueTransformer(nn.Module):
         r_self_output = self.averager(r_self_output, b_attention_mask)
         r_cross_output = self.averager(r_cross_output, a_attention_mask)
 
-        self_output = self.averager(self_output, attention_mask)
-        q_self_output = q_self_output.view(-1, self.sample_nums, self.hidden_size)
-        q_cross_output = q_cross_output.view(-1, self.sample_nums, self.hidden_size)
-        r_self_output = r_self_output.view(-1, self.sample_nums, self.hidden_size)
-        r_cross_output = r_cross_output.view(-1, self.sample_nums, self.hidden_size)
 
-        self_output = self_output.view(-1, self.sample_nums, self.hidden_size)
-        pooled_output = pooled_output.view(-1, self.sample_nums, self.hidden_size)
+
+        self_output = self.averager(self_output, attention_mask)
+        
+        new_shape = (-1, self.sample_nums, self.hidden_size)
+        
+        q_self_output = q_self_output.reshape(new_shape)
+        q_cross_output = q_cross_output.reshape(new_shape)
+        r_self_output = r_self_output.reshape(new_shape)
+        r_cross_output = r_cross_output.reshape(new_shape)
+
+
+        self_output = self_output.reshape(new_shape)
+        #pooled_output = pooled_output.reshape(new_shape)
 
         output = self_output[:, 0, :]
         q_output = q_self_output[:, 0, :]
@@ -115,30 +119,39 @@ class DialogueTransformer(nn.Module):
         logit_r = mx.stack(logit_r, axis = 1)
         logit_q = mx.stack(logit_q, axis = 1)
 
+        loss_r = self.calc_loss(logit_r, labels)
+        loss_q = self.calc_loss(logit_q, labels)
+
         output_dict = {
+            'final_feature': output if strategy == 'mean' else q_output + r_output,
             'q_feature' : q_output, 
             'r_feature' : r_output,
-            'attention' : w 
+            'attention' : w,
+            'loss' : loss_r + loss_q
         }
+
+        return output_dict
 
     def encode(self, *x):
         input_ids, attention_mask, position_ids = x
 
         output = self.model(input_ids = input_ids,
                             attention_mask = attention_mask, 
-                            position_ids = position_ids, 
-                            output_hidden_states = True, 
-                            return_dict = True)
-        
-        all_output = output['hidden_states']
+                            position_ids = position_ids,
+                            return_dict = False,
+                            output_hidden_states = True)
 
-        pooler_output = output['last_hidden_state'][:, 0]
-        pooler_output = self.pooler(pooler_output)
 
-        return all_output[-1], pooler_output
+
+        return output.hidden_states[0][-1], output.pooler_output 
 
 
     def calc_cos(self, x, y) -> float:
-        cos = cosine_similarity(x, y)
+        cos = cosine_similarity_loss(x, y)
         cos = cos / 1.0 
         return cos 
+    
+    def calc_loss(self, pred, labels):
+        loss = -mx.mean(self.log_softmax(pred) * labels)
+        return loss
+
