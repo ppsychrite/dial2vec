@@ -21,14 +21,21 @@ class PoolingAverage(nn.Module):
 
 class DialogueTransformer(nn.Module):
 
-    def __init__(self, bert):
+    def __init__(self, bert, config):
         super().__init__()
+
+        if "temperature" not in config: 
+            self.temperature = 1.0 
+        else: 
+            self.temperature = config['temperature']
 
         self.model = bert
         self.averager = PoolingAverage(eps = 1e-6)
         self.log_softmax = nn.LogSoftmax()
 
         self.hidden_size = self.model.config.hidden_size 
+
+        # Not to be confused with batch size, basically format of .tsv of 1 positive and 9 negatives 
         self.sample_nums = 10 
 
 
@@ -49,31 +56,42 @@ class DialogueTransformer(nn.Module):
         position_ids = mx.reshape(attention_mask, new_shape)
         role_ids = mx.reshape(role_ids, new_shape)
 
+
+        # Right now handles two speakers, for multiple, would have to check if i != |speakers|
         one_mask = mx.ones_like(role_ids)
         zero_mask = mx.zeros_like(role_ids)
 
         role_a_mask = mx.where(role_ids == 0, one_mask, zero_mask)
         role_b_mask = mx.where(role_ids == 1, one_mask, zero_mask)
 
+        # m^{p_1} and m^{p_2} 
         a_attention_mask = (attention_mask * role_a_mask)
         b_attention_mask = (attention_mask * role_b_mask)
 
+        
 
+        # Pooled output doesn't seem to be used in lieu of averager 
         self_output, pooled_output = self.encode(input_ids, 
                                                  attention_mask, 
                                                  position_ids)
 
 
+        # 3.2.2 (1)
         q_self_output = self_output * mx.expand_dims(a_attention_mask, axis = -1)
         r_self_output = self_output * mx.expand_dims(b_attention_mask, axis = -1)
 
+
+
         self_output = self_output * mx.expand_dims(attention_mask, axis = -1)
-
-
+        
+        # 3.2.2 (2)
+        # Doesn't do both C^{p1} & C^{p2} because it just needs pairwise interactions methinks. 
         w = mx.matmul(q_self_output, mx.transpose(r_self_output, axes = [0, -1, -2]))
 
-        # Turn id check is deprecated in ModernBERT, skip it 
+        # Turn id check is deprecated in ModernBERT, skip it (From previous code)
 
+
+        # 3.2.2 (3)
         q_cross_output = mx.matmul(
             mx.transpose(w, axes = [0, 2, 1]),
             q_self_output
@@ -84,12 +102,11 @@ class DialogueTransformer(nn.Module):
             r_self_output
         )
 
+        # Variant of 3.2.3 (4)
         q_self_output = self.averager(q_self_output, a_attention_mask)
         q_cross_output = self.averager(q_cross_output, b_attention_mask)
         r_self_output = self.averager(r_self_output, b_attention_mask)
         r_cross_output = self.averager(r_cross_output, a_attention_mask)
-
-
 
         self_output = self.averager(self_output, attention_mask)
         
@@ -108,6 +125,8 @@ class DialogueTransformer(nn.Module):
         q_output = q_self_output[:, 0, :]
         r_output = r_self_output[:, 0, :]
 
+
+        # Cosine distances are needed of individual rows for loss function on 3.2.4 (5) 
         logit_q = [] 
         logit_r = []  
         for i in range(self.sample_nums): 
@@ -148,7 +167,7 @@ class DialogueTransformer(nn.Module):
 
     def calc_cos(self, x, y) -> float:
         cos = cosine_similarity_loss(x, y)
-        cos = cos / 1.0 
+        cos = cos / self.temperature 
         return cos 
     
     def calc_loss(self, pred, labels):
